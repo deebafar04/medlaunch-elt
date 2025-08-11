@@ -1,10 +1,13 @@
-*.swp
-package-lock.json
-__pycache__
-.pytest_cache
-.venv
-*.egg-info
+# Python
+.venv/
+__pycache__/
+*.pyc
 
-# CDK asset staging directory
-.cdk.staging
-cdk.out
+# CDK
+cdk.out/
+cdk.context.json
+
+# Local test data & temp
+data/
+aws/
+*.jsonl
