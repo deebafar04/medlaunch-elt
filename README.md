@@ -116,4 +116,21 @@ I am **not** using the sample MedLaunch dataset for this assessment. All records
   Labelled the bucket with `DataClass=Confidential` and `ContainsPHI=No (Synthetic)`. Clear labels help reviewers and cost/reporting tools.
 
 ----------------------
+### Implementation
+#### Stage 1
+**Architecture Diagram**
+
+<img width="761" height="340" alt="image" src="https://github.com/user-attachments/assets/e2d0bd2f-3976-4d3e-a960-93ba2d5e980a" />
+
+**End-to-end flow:**
+
+* NDJSON data lands in S3 under `bronze-raw-ingested-data/<YYYY-MM-DD>/`.
+* Glue Data Catalog has a table that describes the JSON structure and the `snapshot_date` layout.
+* Athena uses that Glue schema to read the nested JSON without custom code. The data extracted is stored in bronze_facilities_json_np table.
+* Run the stage1_facility_metrics_create SQL to select: facility\_id, facility\_name, employee\_count, number\_of\_offered\_services, and the first accreditation’s expiry date. This SQL refers to the base table bronze_facilities_json_np to retrieve the data.
+* The query applies DQ checks (FAC prefix, non-blank name, non-negative counts) and dedupes by `(snapshot_date, facility_id)`.
+* Valid rows are written back to S3 as Parquet in stage1-athena-parquet-results/stage1_facility_metrics/, partitioned by `snapshot_date` (curated dataset).
+* Run the stage1_facility_metrics_rejects SQL. Invalid rows are written to stage1-athena-parquet-results/stage1_facility_metrics_rejects with a `reject_reason`.
+* S3 buckets stay encrypted (KMS), private (no public access), and HTTPS-only; IAM limits Athena to just the prefixes it needs.
+
 
