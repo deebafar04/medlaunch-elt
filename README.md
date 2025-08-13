@@ -150,3 +150,27 @@ I am **not** using the sample MedLaunch dataset for this assessment. All records
 * After scanning all inputs, we write per-file rejects to `python-computed-outputs/quarantine/<snapshot_date>/<file>_rejects.jsonl` so bad rows are easy to review without polluting outputs.
 * Emit structured INFO logs (files processed, rows emitted/rejected, output paths) to Amazon CloudWatch Logs for audit and troubleshooting.
 * S3 is KMS-encrypted, private (Block Public Access), and HTTPS-only; the Lambda role has least-privilege IAM: `ListBucket`/`GetObject` on bronze and `PutObject` on the output prefixes.
+
+#### Stage 3
+**Architecture Diagram**
+
+<img width="1015" height="481" alt="image" src="https://github.com/user-attachments/assets/bf147115-ddf7-469d-885c-eda0428dde5c" />
+
+**End-to-end flow:**
+
+* A new JSON file lands in `s3://medlaunch-elt-datalake/bronze-raw-ingested-data/batch/<YYYY-MM-DD>/*.jsonl`. This upload **automatically triggers** the Stage-3 Lambda.
+* The Lambda quickly checks the event. If the file isn’t a bronze `.jsonl`, it **ignores** it.
+* It creates a unique **run id** (`run_ts`) for this invocation and reads its settings (DB name, scratch/output paths).
+* The Lambda asks **Athena** to run SQL that **counts accredited facilities per state** (and another SQL that lists **rejects** with reasons).
+* Athena writes those results into two Parquet-backed tables in S3 (stored under `stage3-athena-parquet-results/...`), so they’re easy to query later.
+* The Lambda then **checks how many rows** were inserted for this `run_ts`.
+* If rows exist, it **exports** each result set to easy-to-download **CSV** files:
+
+  * Processed counts → `stage3-athena-query-results/Processed Results/accredited_facilities_per_state/run_ts=<run_ts>/`
+  * Rejects → `stage3-athena-query-results/Rejected Results/accredited_facilities_per_state/run_ts=<run_ts>/`
+* If that `run_ts` folder already exists, the Lambda **skips the export** to avoid duplicates (idempotent behavior).
+* Throughout the run, it writes simple JSON logs (start, query ids, row counts, output paths) to **CloudWatch Logs** so you can see exactly what happened.
+* If Athena takes too long, the Lambda **cancels** the query and fails fast. Normal Lambda **retries** handle transient issues.
+* Security is on by default: S3 is **KMS-encrypted**, bucket access is private and **HTTPS-only**, and the Lambda’s IAM role can read the bronze path and write only to its own output prefixes.
+
+-------------------
