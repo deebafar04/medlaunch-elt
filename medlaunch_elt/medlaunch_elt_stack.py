@@ -1,31 +1,27 @@
+# medlaunch_elt_stack.py
 """
-medlaunch_elt_stack.py
+MedLaunch ELT (CDK) — S3, KMS, Glue, and two Lambdas. No Step Functions.
 
-Sets up the S3 foundation for the MedLaunch ELT pipeline with HIPAA-aware defaults:
-- Customer-managed KMS key (CMK) for at-rest encryption
-- Main data-lake bucket with clear, purpose-driven prefixes:
-    * bronze-raw-ingested-data/        -> raw NDJSON ingest
-    * silver-cleaned-stage1-parquet/   -> curated Parquet from Stage 1 (Athena/CTAS)
-    * gold-curated-stage2-parquet/     -> curated Parquet from Stage 2 (Python writes Parquet)
-    * athena-query-results/            -> Athena query result scratch
-    * python-computed-outputs/         -> Python/boto3 outputs (e.g., JSON manifests)
-- Separate access-logs bucket
-- TLS-only bucket policy, public access blocks, versioning
-- Lifecycle rules for short-lived prefixes
-- Useful tags and CloudFormation outputs
+Builds the data lake stack: KMS key, S3 data + access-log buckets with lifecycle rules,
+Glue database + bronze JSON table (projection), and two Lambdas. Wires an S3
+ObjectCreated trigger to the Stage 3 Athena runner. Exposes useful outputs
 
-Adds Glue Data Catalog bits:
-- Glue Database for our tables
-- Glue Data Catalog encryption at rest (SSE-KMS with our CMK)
-- Bronze JSON table with partition projection on snapshot_date
+Creates
+- KMS CMK (rotation on)
+- S3 data lake + access-logs buckets with lifecycle rules
+- Glue DB + bronze JSON table (snapshot_date projection)
+- Lambda Stage 2: expiring accreditations (sweeps bronze)
+- Lambda Stage 3: Athena runner + S3 trigger on bronze *.jsonl
 
-Notes:
-- For the assessment, resources use DESTROY/auto_delete_objects for fast teardown.
-  For production, switch to RETAIN and remove auto_delete_objects.
+Key S3 prefixes
+- bronze-raw-ingested-data/                  raw NDJSON ingest
+- stage1-athena-*/                           Stage 1 scratch + Parquet
+- stage3-athena-query-results/{Processed Results, Rejected Results, _scratch}/
+- stage3-athena-parquet-results/             Stage 3 Parquet outputs
+- python-computed-outputs/                   Python/boto3 outputs
 """
 
 from __future__ import annotations
-
 from typing import Final
 
 from aws_cdk import (
@@ -36,45 +32,48 @@ from aws_cdk import (
     Tags,
     aws_iam as iam,
     aws_kms as kms,
+    aws_logs as logs,
     aws_s3 as s3,
     aws_s3_deployment as s3deploy,
     aws_glue as glue,
 )
 from constructs import Construct
+from aws_cdk import aws_lambda as _lambda
+from aws_cdk import aws_s3_notifications as s3n
 
-# ---- Constants (easy to tweak; avoid magic numbers) -------------------------
+# ---- Constants ---------------------------------------------------------------
 
 PROJECT_TAG: Final[str] = "MedLaunch"
 KMS_ALIAS: Final[str] = "alias/medlaunch-data-lake"
 
 ATHENA_RESULTS_RETENTION_DAYS: Final[int] = 14
 QUARANTINE_RETENTION_DAYS: Final[int] = 60
-
 GLUE_DB_NAME: Final[str] = "medlaunch_db"
+
+# ---- Stack -------------------------------------------------------------------
 
 
 class MedlaunchEltStack(Stack):
-    """Primary infrastructure for the ELT data lake (S3 + KMS + Glue + policies + lifecycle)."""
+    """Primary infra for the ELT data lake (S3 + KMS + Glue + Lambdas)."""
 
     def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
-        # 1) Customer-managed KMS key (CMK) for the data lake
-        data_key: kms.Key = kms.Key(
+        # 1) KMS CMK (DEV: destroy on stack delete; use RETAIN in prod)
+        data_key = kms.Key(
             self,
             "DataLakeKey",
             alias=KMS_ALIAS,
             enable_key_rotation=True,
-            # DEV/Assessment: allow clean teardown; PROD: use RETAIN
             removal_policy=RemovalPolicy.DESTROY,
         )
 
-        # Compose globally-unique, readable bucket names (lowercase, hyphenated)
+        # Globally-unique bucket names
         logs_bucket_name = f"medlaunch-elt-logs-{self.account}-{self.region}"
         data_bucket_name = f"medlaunch-elt-datalake-{self.account}-{self.region}"
 
-        # 2) S3 bucket for server access logs (use S3-managed enc for log target)
-        logs_bucket: s3.Bucket = s3.Bucket(
+        # 2) Access-logs bucket (no public access)
+        logs_bucket = s3.Bucket(
             self,
             "AccessLogsBucket",
             bucket_name=logs_bucket_name,
@@ -86,8 +85,8 @@ class MedlaunchEltStack(Stack):
         )
         _tag(logs_bucket, Purpose="S3AccessLogs")
 
-        # 3) Main data-lake bucket with SSE-KMS, versioning, logging, and lifecycle
-        data_bucket: s3.Bucket = s3.Bucket(
+        # 3) Data lake bucket (KMS-encrypted, versioned, server logs enabled)
+        data_bucket = s3.Bucket(
             self,
             "DataLakeBucket",
             bucket_name=data_bucket_name,
@@ -100,23 +99,31 @@ class MedlaunchEltStack(Stack):
             removal_policy=RemovalPolicy.DESTROY,
             auto_delete_objects=True,
         )
+        _deny_insecure_transport(data_bucket)  # enforce HTTPS
 
-        # Enforce TLS-only access (deny any non-HTTPS requests)
-        _deny_insecure_transport(data_bucket)
-
-        # Lifecycle: keep short-lived areas tidy/cost-effective
+        # Lifecycle: clean short-lived areas
         data_bucket.add_lifecycle_rule(
-            id="ExpireAthenaResults",
-            prefix="athena-query-results/",
+            id="ExpireStage1AthenaResults",
+            prefix="stage1-athena-query-results/",
+            expiration=Duration.days(ATHENA_RESULTS_RETENTION_DAYS),
+        )
+        data_bucket.add_lifecycle_rule(
+            id="ExpireStage3ProcessedCsv",
+            prefix="stage3-athena-query-results/Processed Results/",
+            expiration=Duration.days(ATHENA_RESULTS_RETENTION_DAYS),
+        )
+        data_bucket.add_lifecycle_rule(
+            id="ExpireStage3RejectedCsv",
+            prefix="stage3-athena-query-results/Rejected Results/",
             expiration=Duration.days(ATHENA_RESULTS_RETENTION_DAYS),
         )
         data_bucket.add_lifecycle_rule(
             id="ExpireQuarantine",
-            prefix="bronze-raw-ingested-data/quarantine/",
+            prefix="python-computed-outputs/quarantine/",
             expiration=Duration.days(QUARANTINE_RETENTION_DAYS),
         )
 
-        # Governance tags
+        # Tag data bucket for quick discovery/compliance filters
         _tag(
             data_bucket,
             DataClass="Confidential",
@@ -124,26 +131,35 @@ class MedlaunchEltStack(Stack):
             DataSource="Synthetic",
         )
 
-        # Seed prefixes so they’re visible immediately in the console
+        # Seed console-visible prefixes with .keep files
         s3deploy.BucketDeployment(
             self,
             "SeedPrefixes",
             destination_bucket=data_bucket,
             sources=[
                 s3deploy.Source.data("bronze-raw-ingested-data/.keep", "seed"),
-                s3deploy.Source.data("silver-cleaned-stage1-parquet/.keep", "seed"),
-                s3deploy.Source.data("gold-curated-stage2-parquet/.keep", "seed"),
-                s3deploy.Source.data("athena-query-results/.keep", "seed"),
+                s3deploy.Source.data("stage1-athena-query-results/.keep", "seed"),
+                s3deploy.Source.data("stage1-athena-parquet-results/.keep", "seed"),
+                s3deploy.Source.data(
+                    "stage3-athena-query-results/Processed Results/.keep", "seed"
+                ),
+                s3deploy.Source.data(
+                    "stage3-athena-query-results/Rejected Results/.keep", "seed"
+                ),
+                s3deploy.Source.data(
+                    "stage3-athena-query-results/_scratch/.keep", "seed"
+                ),
+                s3deploy.Source.data("stage3-athena-parquet-results/.keep", "seed"),
                 s3deploy.Source.data("python-computed-outputs/.keep", "seed"),
             ],
         )
 
-        # Save references for later (other stacks/stages)
+        # Save refs for other constructs/outputs
         self.data_bucket = data_bucket
         self.logs_bucket = logs_bucket
         self.data_key = data_key
 
-        # 4) Glue: Database + Data Catalog encryption (SSE-KMS with our CMK)
+        # 4) Glue: DB + catalog encryption
         glue_db = glue.CfnDatabase(
             self,
             "GlueDatabase",
@@ -153,8 +169,6 @@ class MedlaunchEltStack(Stack):
                 description="Glue database for MedLaunch ELT",
             ),
         )
-
-        # Encrypt Glue Data Catalog metadata at rest using our KMS key
         glue.CfnDataCatalogEncryptionSettings(
             self,
             "GlueCatalogEncryption",
@@ -164,11 +178,10 @@ class MedlaunchEltStack(Stack):
                     catalog_encryption_mode="SSE-KMS",
                     sse_aws_kms_key_id=self.data_key.key_arn,
                 ),
-                # No Glue connections defined here
             ),
         )
 
-        # 5) Glue: Bronze JSON table with partition projection on snapshot_date
+        # 5) Glue: bronze JSON table (snapshot_date projection)
         bronze_table = glue.CfnTable(
             self,
             "FacilitiesBronzeJson",
@@ -176,21 +189,19 @@ class MedlaunchEltStack(Stack):
             database_name=GLUE_DB_NAME,
             table_input=glue.CfnTable.TableInputProperty(
                 name="bronze_facilities_json",
-                description="Raw facilities NDJSON in bronze-raw-ingested-data/ (partitioned by snapshot_date)",
+                description="Raw facilities NDJSON (partitioned by snapshot_date)",
                 table_type="EXTERNAL_TABLE",
                 parameters={
                     "classification": "json",
                     "typeOfData": "file",
-                    # Partition projection = no MSCK REPAIR needed
                     "projection.enabled": "true",
                     "projection.snapshot_date.type": "date",
                     "projection.snapshot_date.format": "yyyy-MM-dd",
                     "projection.snapshot_date.range": "2024-01-01,NOW",
-                    # Map the partition key to our folder layout:
                     "storage.location.template": f"s3://{self.data_bucket.bucket_name}/bronze-raw-ingested-data/batch/${{snapshot_date}}/",
                 },
                 partition_keys=[
-                    glue.CfnTable.ColumnProperty(name="snapshot_date", type="string"),
+                    glue.CfnTable.ColumnProperty(name="snapshot_date", type="string")
                 ],
                 storage_descriptor=glue.CfnTable.StorageDescriptorProperty(
                     location=f"s3://{self.data_bucket.bucket_name}/bronze-raw-ingested-data/batch/",
@@ -221,25 +232,131 @@ class MedlaunchEltStack(Stack):
                             name="accreditations",
                             type="array<struct<accreditation_body:string,accreditation_id:string,valid_until:string>>",
                         ),
-                        # snapshot_date is a PARTITION KEY
                     ],
                 ),
             ),
         )
         bronze_table.add_dependency(glue_db)
 
-        # Helpful CloudFormation outputs (easy to fetch via CLI/console)
+        # 6) Lambda — Stage 2 (expiring accreditations)
+        stage2_fn = _lambda.Function(
+            self,
+            "Stage2ExpiringLambda",
+            runtime=_lambda.Runtime.PYTHON_3_11,
+            handler="handler.handler",
+            code=_lambda.Code.from_asset(
+                "lambda/stage2_expiring",
+                exclude=["**/__pycache__/**", "**/*.pyc", "requirements.txt"],
+            ),
+            architecture=_lambda.Architecture.X86_64,
+            timeout=Duration.minutes(2),
+            memory_size=512,
+            environment={"DATA_BUCKET": data_bucket.bucket_name, "WINDOW_DAYS": "180"},
+            log_retention=logs.RetentionDays.ONE_WEEK,
+        )
+        # Least-privilege grants
+        data_bucket.grant_read(stage2_fn, "bronze-raw-ingested-data/batch/*")
+        data_bucket.grant_write(stage2_fn, "python-computed-outputs/expiring-soon/*")
+        data_bucket.grant_write(stage2_fn, "python-computed-outputs/quarantine/*")
+        data_bucket.grant_write(stage2_fn, "gold-curated-stage2-parquet/*")
+        data_key.grant_encrypt_decrypt(stage2_fn)
+
+        # 7) Lambda — Stage 3 (Athena runner) with S3 trigger
+        stage3_fn = _lambda.Function(
+            self,
+            "AthenaS3TriggerFn",
+            runtime=_lambda.Runtime.PYTHON_3_11,
+            handler="handler.handler",
+            code=_lambda.Code.from_asset(
+                "lambda/athena_s3trigger",
+                exclude=["**/__pycache__/**", "**/*.pyc"],
+            ),
+            timeout=Duration.minutes(10),
+            memory_size=512,
+            architecture=_lambda.Architecture.X86_64,
+            environment={
+                "DATA_BUCKET": data_bucket.bucket_name,
+                "OUTPUT_SCRATCH": f"s3://{data_bucket.bucket_name}/stage3-athena-query-results/_scratch/",
+                "KMS_KEY_ARN": data_key.key_arn,
+                "ATHENA_DB": GLUE_DB_NAME,
+                "ATHENA_WORKGROUP": "primary",
+                "ATHENA_TIMEOUT_SECONDS": "540",
+                "POLL_INTERVAL_SECONDS": "2.5",
+                # Optional: "BRONZE_TABLE": "bronze_facilities_json_np",
+            },
+            log_retention=logs.RetentionDays.ONE_WEEK,
+        )
+
+        # S3 → Lambda (only bronze *.jsonl)
+        data_bucket.add_event_notification(
+            s3.EventType.OBJECT_CREATED,
+            s3n.LambdaDestination(stage3_fn),
+            s3.NotificationKeyFilter(
+                prefix="bronze-raw-ingested-data/batch/", suffix=".jsonl"
+            ),
+        )
+
+        # Stage-3 IAM: S3 list/read/write + KMS + Athena + Glue read
+        stage3_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["s3:ListBucket", "s3:GetBucketLocation"],
+                resources=[data_bucket.bucket_arn],
+            )
+        )
+        data_bucket.grant_read(stage3_fn, "bronze-raw-ingested-data/batch/*")
+        data_bucket.grant_read_write(stage3_fn, "stage3-athena-query-results/*")
+        data_bucket.grant_read_write(stage3_fn, "stage3-athena-parquet-results/*")
+        data_key.grant_encrypt_decrypt(stage3_fn)
+        stage3_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "athena:StartQueryExecution",
+                    "athena:GetQueryExecution",
+                    "athena:StopQueryExecution",
+                    "athena:GetQueryResults",
+                ],
+                resources=["*"],
+            )
+        )
+        glue_catalog_arn = f"arn:aws:glue:{self.region}:{self.account}:catalog"
+        glue_db_arn = (
+            f"arn:aws:glue:{self.region}:{self.account}:database/{GLUE_DB_NAME}"
+        )
+        glue_table_arn = (
+            f"arn:aws:glue:{self.region}:{self.account}:table/{GLUE_DB_NAME}/*"
+        )
+        stage3_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "glue:GetDatabase",
+                    "glue:GetDatabases",
+                    "glue:GetTable",
+                    "glue:GetTables",
+                    "glue:GetTableVersion",
+                    "glue:GetTableVersions",
+                    "glue:GetPartition",
+                    "glue:GetPartitions",
+                    "glue:BatchGetPartition",
+                    "glue:GetDataCatalogEncryptionSettings",
+                ],
+                resources=[glue_catalog_arn, glue_db_arn, glue_table_arn],
+            )
+        )
+
+        # Stack outputs for quick copy/paste
         CfnOutput(self, "DataLakeBucketName", value=data_bucket.bucket_name)
         CfnOutput(self, "LogsBucketName", value=logs_bucket.bucket_name)
         CfnOutput(self, "KmsKeyArn", value=data_key.key_arn)
         CfnOutput(self, "GlueDatabaseName", value=GLUE_DB_NAME)
+        CfnOutput(self, "Stage2LambdaName", value=stage2_fn.function_name)
+        CfnOutput(self, "AthenaS3TriggerFnName", value=stage3_fn.function_name)
 
 
 # ---- Helpers ----------------------------------------------------------------
 
 
 def _deny_insecure_transport(bucket: s3.Bucket) -> None:
-    """Attach a bucket policy that denies any request not using TLS (HTTPS)."""
+    """Bucket policy: deny any non-TLS (HTTP) access."""
     bucket.add_to_resource_policy(
         iam.PolicyStatement(
             sid="DenyInsecureTransport",
@@ -253,7 +370,7 @@ def _deny_insecure_transport(bucket: s3.Bucket) -> None:
 
 
 def _tag(resource: Construct, **tags: str) -> None:
-    """Apply common tags consistently."""
+    """Apply project tag plus any provided key/values."""
     Tags.of(resource).add("Project", PROJECT_TAG)
     for k, v in tags.items():
         Tags.of(resource).add(k, v)

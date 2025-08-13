@@ -1,0 +1,5 @@
+# Lambda runtime dependencies for Stage-2 function only
+# Pydantic v1 (we use root_validator which is v1-style)
+pydantic==1.10.15
+
+

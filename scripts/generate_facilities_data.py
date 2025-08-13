@@ -1,5 +1,5 @@
 """
-make_facility_batch.py
+generate_facilities_data.py
 
 Generate a synthetic batch of healthcare facility records in NDJSON (one JSON per line)
 under: data/batch/<snapshot_date>/
@@ -10,10 +10,10 @@ Why NDJSON?
 
 Usage examples:
   # Default IDs start at FAC00001
-  python scripts/make_facility_batch.py --n 1000 --chunk 100 --snapshot 2025-08-10
+  Run in command prompt: python scripts/generate_facilities_data.py --n 1000 --chunk 100 --snapshot 2025-08-10
 
   # Different snapshot with non-overlapping IDs (start at FAC00021)
-  python scripts/make_facility_batch.py --n 50 --chunk 10 --snapshot 2025-08-11 --start-index 21
+  Run in command prompt: python scripts/generate_facilities_data.py --n 50 --chunk 10 --snapshot 2025-08-11 --start-index 21
 
 Outputs:
   data/batch/<snapshot_date>/facilities_0001.jsonl

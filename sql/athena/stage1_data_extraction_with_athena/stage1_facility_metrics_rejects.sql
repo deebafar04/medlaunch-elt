@@ -1,27 +1,46 @@
-/* ============================================================================
-Stage 1 — Rejects (CTAS, Parquet, partitioned)
+/* -----------------------------------------------------------------------------
+SQL Script Name:
+    stage1_facility_metrics_rejects.sql
 
-Purpose
-  Persist rows that FAIL Stage-1 DQ rules so we can inspect and fix them later.
+Purpose:
+    Captures and persists all rows from bronze_facilities_json_np that fail
+    Stage 1 data quality (DQ) checks, so they can be reviewed, corrected, and 
+    potentially re-ingested.
 
-DQ rules (fail if any is true)
-  - facility_id does NOT start with 'FAC' (case-insensitive)
-  - facility_name is blank after TRIM
-  - employee_count is NULL or negative
-  - number_of_offered_services is negative (should never happen, but checked)
+What This Script Does:
+    1. Reads raw JSON from the bronze_facilities_json_np.
+    2. Flags records failing any of the following DQ rules:
+        - facility_id does not start with 'FAC' (case-insensitive).
+        - facility_name is blank after trimming.
+        - employee_count is null or negative.
+        - number_of_offered_services is negative (should not occur but checked).
+    3. Assigns a reject_reason code for each failed record.
+    4. Outputs results in Parquet format, partitioned by snapshot_date, for 
+       inspection and remediation.
 
-Output
-  Table:  medlaunch_db.stage1_facility_metrics_rejects
-  Files:  s3://medlaunch-elt-datalake-050451385876-us-east-1/
-          silver-cleaned-stage1-parquet/stage1_facility_metrics_rejects/
-  Format: PARQUET + SNAPPY, partitioned by snapshot_date
-============================================================================ */
+Inputs:
+    Source Table: medlaunch_db.bronze_facilities_json_np
+    Columns Required:
+        facility_id (string)
+        facility_name (string)
+        employee_count (bigint/int)
+        services (array)
+        accreditations (array of structs with valid_until)
+        snapshot_date (date/string)
+
+Outputs:
+    Destination Table: medlaunch_db.stage1_facility_metrics_rejects
+    Output Format: Parquet (Snappy compression)
+    Partition Key: snapshot_date
+    Output Location: 
+        s3://medlaunch-elt-datalake-050451385876-us-east-1/stage1-athena-parquet-results/stage1_facility_metrics_rejects/
+---------------------------------------------------------------------------- */
 
 CREATE TABLE medlaunch_db.stage1_facility_metrics_rejects
 WITH (
   format = 'PARQUET',
   parquet_compression = 'SNAPPY',
-  external_location = 's3://medlaunch-elt-datalake-050451385876-us-east-1/silver-cleaned-stage1-parquet/stage1_facility_metrics_rejects/',
+  external_location = 's3://medlaunch-elt-datalake-050451385876-us-east-1/stage1-athena-parquet-results/stage1_facility_metrics_rejects/',
   partitioned_by = ARRAY['snapshot_date']
 ) AS
 WITH src AS (
@@ -69,5 +88,5 @@ SELECT
   number_of_offered_services,
   expiry_date_of_first_accreditation,
   reject_reason,
-  snapshot_date                                    -- partition column LAST
+  snapshot_date
 FROM rejects;
