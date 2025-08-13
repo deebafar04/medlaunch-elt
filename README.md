@@ -133,4 +133,20 @@ I am **not** using the sample MedLaunch dataset for this assessment. All records
 * Run the stage1_facility_metrics_rejects SQL. Invalid rows are written to stage1-athena-parquet-results/stage1_facility_metrics_rejects with a `reject_reason`.
 * S3 buckets stay encrypted (KMS), private (no public access), and HTTPS-only; IAM limits Athena to just the prefixes it needs.
 
+#### Stage 2
+**Architecture Diagram**
 
+<img width="801" height="645" alt="image" src="https://github.com/user-attachments/assets/5b62f671-f1d1-4ea5-9616-dcbb8f056897" />
+
+**End-to-end flow:**
+
+* Lambda `stage2_expiring_accreditations.py` is invoked with env vars `DATA_BUCKET=medlaunch-elt-datalake` and `WINDOW_DAYS` (default `180`).
+* The function lists all input files under `bronze-raw-ingested-data/batch/<YYYY-MM-DD>/*.jsonl` (and `.jsonl.gz`) and pulls `snapshot_date` from the folder name.
+* Each file is streamed line-by-line from S3 (gzip supported). No full-file loads; memory stays low.
+* For every record, DQ checks are run: `facility_id` starts with `FAC`, `facility_name` not blank, `employee_count` ≥ 0, and `accreditations` present.
+* For each accreditation, we parse `valid_until`; if it falls within `today → today + WINDOW_DAYS`, emit one “expiring-soon” row with facility, location, accreditor, `valid_until`, `days_until_expiry`, `run_date`, and `snapshot_date`.
+* If `valid_until` is missing/invalid (or the record fails any DQ), we write a quarantine line capturing `reject_reason`, file key, and `snapshot_date`.
+* After scanning all inputs, we write a single CSV to `python-computed-outputs/expiring-soon/run_date=<YYYY-MM-DD>/expiring_soon.csv`.
+* After scanning all inputs, we write per-file rejects to `python-computed-outputs/quarantine/<snapshot_date>/<file>_rejects.jsonl` so bad rows are easy to review without polluting outputs.
+* Emit structured INFO logs (files processed, rows emitted/rejected, output paths) to Amazon CloudWatch Logs for audit and troubleshooting.
+* S3 is KMS-encrypted, private (Block Public Access), and HTTPS-only; the Lambda role has least-privilege IAM: `ListBucket`/`GetObject` on bronze and `PutObject` on the output prefixes.
