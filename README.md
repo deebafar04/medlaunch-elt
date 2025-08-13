@@ -1,58 +1,76 @@
+## MedLaunch ELT — Healthcare Facility Data Pipeline 🏥
 
-# Welcome to your CDK Python project!
+### Objective
 
-This is a blank project for CDK development with Python.
+Build an AWS data pipeline that process healthcare facility records stored in S3 to analyze accreditation data.
 
-The `cdk.json` file tells the CDK Toolkit how to execute your app.
+---------------------------------------
+### Requirements
+#### 1. Stage 1 - Data Extraction with Athena
+Use Athena SQL to read nested JSON from S3 and select: `facility_id`, `facility_name`, `employee_count`, `number_of_offered_services`, and `expiry_date_of_first_accreditation`. Save the query results back to S3 so later stages can use them.
 
-This project is set up like a standard Python project.  The initialization
-process also creates a virtualenv within this project, stored under the `.venv`
-directory.  To create the virtualenv it assumes that there is a `python3`
-(or `python` for Windows) executable in your path with access to the `venv`
-package. If for any reason the automatic creation of the virtualenv fails,
-you can create the virtualenv manually.
+#### 2. Stage 2 - Data Processing with Python
+Write a Python script (boto3) that reads JSON records from S3 and finds facilities with any accreditation expiring within 6 months. Write the filtered records to a different S3 location and include basic logging and error handling.
 
-To manually create a virtualenv on MacOS and Linux:
+#### 3. Stage 3 - Event-Driven Processing with Lambda 
+Create a Lambda that triggers when a new JSON file lands in S3 and runs an Athena query to count accredited facilities per state. Store the results in S3 and make sure the function handles timeouts and retries.
 
+#### 4. Stage 4 - Workflow Orchestration with Step Functions (design)
+Design a Step Functions state machine that starts on new S3 data and calls a Lambda to run the Athena query, waiting for it to finish. On success, copy results to a production path; on failure, send an SNS alert and include retry and error handling.
+
+---------------------------------
+### Dataset
+
+I am using **synthetic data** that the repo generates with 'scripts/generate_facilities_data.py'. It writes NDJSON files (one JSON per line) under 'data/batch/<snapshot_date>/'. This keeps the format simple and easy to stream.
+
+#### How many records I used to test**
+I generated **76 records** across three snapshots:
+
+* 20 records for '2025-08-10'
+* 50 records for '2025-08-11'
+* 6 records for '2025-08-13' - this contains bad data to demonstrate testing.
+
+> To reproduce (run from the repo root):
+>
+> ```
+> python scripts/generate_facilities_data.py --n 1000 --chunk 100 --snapshot 2025-08-10
+> python scripts/generate_facilities_data.py --n 50 --chunk 10 --snapshot 2025-08-11 --start-index 21
+> ```
+
+#### Example JSON record (one line in the .jsonl file)**
+
+```json
+{
+  "facility_id": "FAC00042",
+  "facility_name": "Grand Rapids Medical Center",
+  "location": {
+    "address": "1234 Oak Street",
+    "city": "Grand Rapids",
+    "state": "MI",
+    "zip": "49503"
+  },
+  "employee_count": 312,
+  "services": ["Primary Care", "Radiology", "Cardiology"],
+  "labs": [
+    {"lab_name": "Hematology Lab", "certifications": ["CLIA"]}
+  ],
+  "accreditations": [
+    {"accreditation_body": "Joint Commission", "accreditation_id": "JC712", "valid_until": "2025-11-15"},
+    {"accreditation_body": "NCQA", "accreditation_id": "NCQA384", "valid_until": "2026-03-30"}
+  ],
+  "snapshot_date": "2025-08-10"
+}
 ```
-$ python -m venv .venv
-```
 
-After the init process completes and the virtualenv is created, you can use the following
-step to activate your virtualenv.
+#### What the fields mean (quick tour)**
 
-```
-$ source .venv/bin/activate
-```
+* 'facility_id', 'facility_name': the identifier and display name. IDs start with 'FAC' and are numbered.
+* 'location': address info: 'address', `city`, `state` (US two-letter code), and `zip`.
+* `employee_count`: whole number of employees; the generator keeps it within a realistic range.
+* `services`: small list of offered services (e.g., Primary Care, Radiology).
+* `labs`: zero to two lab entries, each with a `lab_name` and one or more `certifications` (e.g., CLIA, CAP).
+* `accreditations`: one or two records showing who accredited the facility, an `accreditation_id`, and a `valid_until` date in `YYYY-MM-DD`.
+* `snapshot_date`: the data snapshot date; it’s also used to organize output folders.
 
-If you are a Windows platform, you would activate the virtualenv like this:
-
-```
-% .venv\Scripts\activate.bat
-```
-
-Once the virtualenv is activated, you can install the required dependencies.
-
-```
-$ pip install -r requirements.txt
-```
-
-At this point you can now synthesize the CloudFormation template for this code.
-
-```
-$ cdk synth
-```
-
-To add additional dependencies, for example other CDK libraries, just add
-them to your `setup.py` file and rerun the `pip install -r requirements.txt`
-command.
-
-## Useful commands
-
- * `cdk ls`          list all stacks in the app
- * `cdk synth`       emits the synthesized CloudFormation template
- * `cdk deploy`      deploy this stack to your default AWS account/region
- * `cdk diff`        compare deployed stack with current state
- * `cdk docs`        open CDK documentation
-
-Enjoy!
+#### Note
+I am **not** using the sample MedLaunch dataset for this assessment. All records here are generated by the script.
