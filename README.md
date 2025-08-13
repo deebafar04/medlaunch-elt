@@ -23,7 +23,7 @@ Design a Step Functions state machine that starts on new S3 data and calls a Lam
 
 I am using **synthetic data** that the repo generates with 'scripts/generate_facilities_data.py'. It writes NDJSON files (one JSON per line) under 'data/batch/<snapshot_date>/'. This keeps the format simple and easy to stream.
 
-#### How many records I used to test**
+#### How many records I used to test
 I generated **76 records** across three snapshots:
 
 * 20 records for '2025-08-10'
@@ -37,7 +37,7 @@ I generated **76 records** across three snapshots:
 > python scripts/generate_facilities_data.py --n 50 --chunk 10 --snapshot 2025-08-11 --start-index 21
 > ```
 
-#### Example JSON record (one line in the .jsonl file)**
+#### Example JSON record (one line in the .jsonl file)
 
 ```json
 {
@@ -62,7 +62,7 @@ I generated **76 records** across three snapshots:
 }
 ```
 
-#### What the fields mean (quick tour)**
+#### What the fields mean (quick tour)
 
 * 'facility_id', 'facility_name': the identifier and display name. IDs start with 'FAC' and are numbered.
 * 'location': address info: 'address', `city`, `state` (US two-letter code), and `zip`.
@@ -173,6 +173,32 @@ I am **not** using the sample MedLaunch dataset for this assessment. All records
 * If Athena takes too long, the Lambda **cancels** the query and fails fast. Normal Lambda **retries** handle transient issues.
 * Security is on by default: S3 is **KMS-encrypted**, bucket access is private and **HTTPS-only**, and the Lambda’s IAM role can read the bronze path and write only to its own output prefixes.
 
+#### Stage 4 — Planned Workflow (Step Functions)
+**Note** Due to time constraint, this stage is not implemented. However, the below are the steps depicting how I would have implemented.
+
+**End-to-end flow**
+
+* A new file lands at `bronze-raw-ingested-data/batch/<YYYY-MM-DD>/*.jsonl`. This upload fires an **EventBridge** event.
+* An **EventBridge rule** starts the **Step Functions** state machine (only for `.jsonl` under that prefix).
+* The workflow calls our **Stage-3 Lambda**. It runs Athena, inserts rows, and exports CSVs for this run (tagged with `run_ts`).
+* The workflow waits for the Lambda to finish and checks row counts. If zero, it stops. If rows exist, it continues.
+* It **copies results** from the staging prefixes to **production** prefixes (one path for processed, one for rejects).
+* On success, it ends. On failure, it sends an **SNS** alert with the bucket, key, error, and `run_ts`.
+
+**State machine (states):**
+
+* **ValidateEvent** — Guardrail. Only continue for bronze `.jsonl` keys.
+* **RunStage3** — Invoke the existing Lambda (sync). Get `run_ts`, row counts, and the CSV target prefixes.
+* **CheckCounts** — If both processed and rejects are zero, end; otherwise continue.
+* **CopyProcessed** — Copy everything under
+  `stage3-athena-query-results/Processed Results/accredited_facilities_per_state/run_ts=<run_ts>/`
+  to a production prefix, e.g.
+  `prod/processed/accredited_facilities_per_state/run_ts=<run_ts>/`.
+* **CopyRejects** — Same copy step for the rejects prefix.
+* **Success** — End of workflow.
+* **NotifyFailure** — If any step throws, publish an **SNS** message with context (bucket, key, error, `run_ts`).
+
+
 -------------------
 ### Run/Execution Instructions
 
@@ -260,3 +286,50 @@ type out.json
 Just upload a new JSONL file to the bronze path; the **S3 event** fires the Lambda.
 
 ---
+### Tech stack ⚙️
+
+**Cloud**
+
+* **Amazon S3** — data lake (bronze, curated, exports)
+* **AWS Glue Data Catalog** — schemas for bronze and curated tables
+* **Amazon Athena** — SQL on S3 (CTAS/INSERT/UNLOAD)
+* **AWS Lambda (Python 3.12)** — Stage 2 filter, Stage 3 event runner
+* **AWS Step Functions** — orchestration (Stage 4, planned)
+* **Amazon EventBridge** — S3 event → Step Functions trigger (planned)
+* **AWS KMS** — SSE-KMS encryption for buckets/outputs
+* **AWS IAM** — least-privilege access
+* **Amazon CloudWatch Logs** — run logs and troubleshooting
+
+**Languages & libs**
+
+* **Python 3.12** — Lambda + utilities
+
+  * **boto3** — S3/Athena/KMS/IAM calls
+  * **pandas** (via awswrangler) — DataFrame → Parquet
+  * **Faker** — synthetic data generator
+* **SQL (Athena)** — Stage 1 and Stage 3 queries
+
+**IaC & tooling**
+
+* **AWS CDK (Python)** — buckets, keys, Glue, Lambdas, notifications
+* **AWS CLI** — quick triggers and uploads
+
+**Data formats**
+
+* **NDJSON** (bronze input)
+* **Parquet (Snappy)** (curated tables)
+* **CSV** (human-friendly exports)
+
+#### Cleanup
+
+We have deployed the code using CDK. 
+
+```
+cdk destroy
+```
+
+This removes the stack resources (buckets must be empty or set to auto-delete in dev).
+
+#### Thanks
+
+Thanks for reading. If something’s unclear, file an issue with a screenshot or log snippet (deebafar04@gmail.com) and I’ll tighten the docs.
