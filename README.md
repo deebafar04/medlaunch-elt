@@ -174,3 +174,89 @@ I am **not** using the sample MedLaunch dataset for this assessment. All records
 * Security is on by default: S3 is **KMS-encrypted**, bucket access is private and **HTTPS-only**, and the Lambda’s IAM role can read the bronze path and write only to its own output prefixes.
 
 -------------------
+### Run/Execution Instructions
+
+#### Stage 1
+
+**Run order**
+
+1. `stage1_facility_metrics_create.sql` — create curated table (CTAS).
+2. `stage1_facility_metrics_rejects.sql` — create rejects table (CTAS).
+3. `stage1_facility_metrics_insert.sql` — append **new** snapshot\_date partitions to curated.
+4. `stage1_facility_metrics_rejects_insert.sql` — append **new** partitions to rejects.
+
+> On day-2 and later: run **only** steps 3 and 4 to load the new dates.
+
+**Option 1: Athena console (quickest)**
+
+* Open **Athena → Query editor**.
+* Set **Database** = `medlaunch_db`, **Workgroup** = `primary`.
+* Run the files in the order above (adjust file paths if needed).
+* Outputs:
+
+  * Curated Parquet → `s3://<bucket>/stage1-athena-parquet-results/stage1_facility_metrics/`
+  * Rejects Parquet → `s3://<bucket>/stage1-athena-parquet-results/stage1_facility_metrics_rejects/`
+
+**Opetion 2: Windows CMD (AWS CLI)**
+
+> Replace `<BUCKET>` 
+
+```cmd
+set BUCKET=<YOUR_BUCKET_NAME>
+set DB=medlaunch_db
+set WG=primary
+
+:: 1) Create curated table
+aws athena start-query-execution ^
+  --query-string file://sql/athena/stage1_data_extarction_with_athena/stage1_facility_metrics_create.sql ^
+  --query-execution-context Database=%DB% ^
+  --work-group %WG% ^
+  --result-configuration OutputLocation=s3://%BUCKET%/stage1-athena-parquet-results/
+
+:: 2) Create rejects table
+aws athena start-query-execution ^
+  --query-string file://sql/athena/stage1_data_extarction_with_athena/stage1_facility_metrics_rejects.sql ^
+  --query-execution-context Database=%DB% ^
+  --work-group %WG% ^
+  --result-configuration OutputLocation=s3://%BUCKET%/stage1-athena-parquet-results/
+
+:: 3) Insert only NEW partitions into curated
+aws athena start-query-execution ^
+  --query-string file://sql/athena/stage1_data_extarction_with_athena/stage1_facility_metrics_insert.sql ^
+  --query-execution-context Database=%DB% ^
+  --work-group %WG% ^
+  --result-configuration OutputLocation=s3://%BUCKET%/stage1-athena-parquet-results/
+
+:: 4) Insert only NEW partitions into rejects
+aws athena start-query-execution ^
+  --query-string file://sql/athena/stage1_data_extarction_with_athena/stage1_facility_metrics_rejects_insert.sql ^
+  --query-execution-context Database=%DB% ^
+  --work-group %WG% ^
+  --result-configuration OutputLocation=s3://%BUCKET%/stage1-athena-parquet-results/
+```
+
+**Notes**
+
+* These scripts assume inputs live under `bronze-raw-ingested-data/batch/<YYYY-MM-DD>/` and tables are partitioned by `snapshot_date`.
+* If you re-ingest the same date and need to refresh, delete that date’s partition in S3 (both curated and rejects) **before** re-running the insert scripts.
+* Keep a lifecycle rule on `stage1-athena-query-results/` (7–14 days) to control cost.
+---
+#### Stage 2
+
+**Option 1: Trigger from CMD (manual run)**
+
+
+```cmd
+set FN=<STAGE2_LAMBDA_NAME>
+aws lambda invoke --function-name %FN% --payload "{}" out.json --log-type Tail
+type out.json
+```
+---
+
+#### Stage 3 — Lambda (event-driven Athena + CSV export)
+
+**Auto-trigger**
+
+Just upload a new JSONL file to the bronze path; the **S3 event** fires the Lambda.
+
+---
