@@ -1,5 +1,6 @@
 ## MedLaunch ELT — Healthcare Facility Data Pipeline 🏥
 
+#### Demo Link: https://www.loom.com/share/ee0df09496cf4511bdabecaff55440e0?sid=e7351bb0-c3b4-4386-ac3b-bc207dc200e3
 ### Objective
 
 Build an AWS data pipeline that process healthcare facility records stored in S3 to analyze accreditation data.
